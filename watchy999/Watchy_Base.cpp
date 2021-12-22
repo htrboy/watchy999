@@ -74,6 +74,15 @@ void WatchyBase::init(String datetime) {
     Serial.begin(115200);
 
   NVS.begin();
+  
+  //init BLE server
+//  BLEDevice::init("Watchy");
+//  BLEScan* pBLEScan = BLEDevice::getScan();
+//  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+//  pBLEScan->setInterval(1349);
+//  pBLEScan->setWindow(449);
+//  pBLEScan->setActiveScan(true);
+//  pBLEScan->start(5, false);
 
   if (runOnce) {
     size_t blobLength = NVS.getBlobSize("dezign");
