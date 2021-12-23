@@ -85,6 +85,11 @@ void WatchyBase::init(String datetime) {
 //  pBLEScan->start(5, false);
 
   if (runOnce) {
+    // TROUBLESHOOTING - clear NV mem on reboot
+    // to reset watch state
+    //if (debugger && runOnce) {    
+    //NVS.eraseAll(runOnce); 
+    //}
     size_t blobLength = NVS.getBlobSize("dezign");
     uint8_t dezign[blobLength];
     res = NVS.getBlob("dezign", dezign, sizeof(dezign));
