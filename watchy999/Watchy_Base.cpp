@@ -2,13 +2,14 @@
 #include "Watchy_Base.h"
 #include "config999.h"
 #include "ArduinoNvs.h"
-#include "esp_sntp.h"
 
+WatchyRTC WatchyBase::RTC;
+GxEPD2_BW<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT> WatchyBase::display(GxEPD2_154_D67(CS, DC, RESET, BUSY));
 
 RTC_DATA_ATTR bool runOnce = true;
 RTC_DATA_ATTR uint8_t twelveMode = 0;
-RTC_DATA_ATTR uint8_t darkMode = 0;
-RTC_DATA_ATTR uint8_t syncNTP = 0;
+RTC_DATA_ATTR uint8_t darkMode = 1;
+RTC_DATA_ATTR uint8_t ntpMode = 1;
 RTC_DATA_ATTR uint8_t animMode = 3;
 RTC_DATA_ATTR uint8_t dateMode = 0;
 RTC_DATA_ATTR int wifiMode = 0;
@@ -27,6 +28,7 @@ RTC_DATA_ATTR bool watchAction = false;
 RTC_DATA_ATTR weatherData latestWeather;
 RTC_DATA_ATTR bool showWeather = false;
 RTC_DATA_ATTR bool showBorder = false;
+RTC_DATA_ATTR bool toggleBorder = false;
 RTC_DATA_ATTR bool showSteps = false;
 RTC_DATA_ATTR bool isNight = false;
 RTC_DATA_ATTR int prefAP = 999;
@@ -38,9 +40,15 @@ RTC_DATA_ATTR uint8_t SLEEP_HOUR = 0;
 RTC_DATA_ATTR uint8_t SLEEP_MINUTE = 0;
 RTC_DATA_ATTR uint8_t SYNC_HOUR = 23;
 RTC_DATA_ATTR uint8_t SYNC_MINUTE = 59;
+RTC_DATA_ATTR bool displayFullInit_ = true;
+RTC_DATA_ATTR bool initialSync = false;
+RTC_DATA_ATTR bool dateToggle = false;
+RTC_DATA_ATTR bool hasDarkMode = false;
+RTC_DATA_ATTR bool isSleeping = false;
 
 int i, n;
 bool res;
+bool saveChanges = false;
 bool manualSync = false;
 const char *offsetStatus = "success";
 
@@ -52,21 +60,19 @@ WatchyBase::WatchyBase() {}
 void WatchyBase::interruptAlarm(bool enable) {
   if (enable) {
     RTC.clearAlarm();
-  if(RTC.rtcType == DS3231){
-//      RTC.rtc_ds.squareWave(SQWAVE_NONE); //disable square wave output
-//      RTC.rtc_ds.setAlarm(ALM2_EVERY_MINUTE, 0, 0, 0, 0); //alarm wakes up Watchy every minute
-      RTC.rtc_ds.alarmInterrupt(ALARM_2, true); //enable alarm interrupt   
-    }else{
+    if (RTC.rtcType == DS3231) {
+      RTC.rtc_ds.alarmInterrupt(ALARM_2, true); //enable alarm interrupt
+    } else {
       int nextAlarmMinute = RTC.rtc_pcf.getMinute();
       nextAlarmMinute = (nextAlarmMinute == 59) ? 0 : (nextAlarmMinute + 1);
-      RTC.rtc_pcf.setAlarm(nextAlarmMinute, 99, 99, 99);  
+      RTC.rtc_pcf.setAlarm(nextAlarmMinute, 99, 99, 99);
     }
   } else {
-    if (RTC.rtcType == PCF8563) 
-      RTC.rtc_pcf.resetAlarm(); 
-    else 
-      RTC.rtc_ds.alarmInterrupt(ALARM_2,false); 
-  }  
+    if (RTC.rtcType == PCF8563)
+      RTC.rtc_pcf.resetAlarm();
+    else
+      RTC.rtc_ds.alarmInterrupt(ALARM_2, false);
+  }
 }
 
 void WatchyBase::init(String datetime) {
@@ -99,42 +105,48 @@ void WatchyBase::init(String datetime) {
       twelveMode = dezign[1];
       animMode = dezign[2];
       weatherMode = dezign[3];
-      syncNTP = dezign[4];
-      darkMode = dezign[5];
-      weatherFormat = dezign[6];
-      dateMode = dezign[7];
-      disableSleepMode = dezign[8];
-      SLEEP_HOUR = dezign[9];
-      SLEEP_MINUTE = dezign[10];
-      SYNC_HOUR = dezign[11];
-      SYNC_MINUTE = dezign[12];
+      ntpMode = dezign[4];
+      weatherFormat = dezign[5];
+      dateMode = dezign[6];
+      disableSleepMode = dezign[7];
+      SLEEP_HOUR = dezign[8];
+      SLEEP_MINUTE = dezign[9];
+      SYNC_HOUR = dezign[10];
+      SYNC_MINUTE = dezign[11];
     } else {
       //set defaults
-      //[0]watchFace, [1]twelveMode, [2]animMode, [3]weatherMode, [4]syncNTP, [5]darkMode, [6]weatherFormat, [7]dateMode
-      //[8]disableSleepMode, [9]SLEEP_HOUR, [10]SLEEP_MINUTE
-      uint8_t dezignString [13] = { watchFace, twelveMode, animMode, weatherMode, 1, 1, 1, 0, disableSleepMode, SLEEP_HOUR, SLEEP_MINUTE, SYNC_HOUR, SYNC_MINUTE };
+      //[0]watchFace, [1]twelveMode, [2]animMode, [3]weatherMode, [4]ntpMode, [5]weatherFormat, [6]dateMode
+      //[7]disableSleepMode, [8]SLEEP_HOUR, [9]SLEEP_MINUTE
+      uint8_t dezignString [12] = {watchFace, twelveMode, animMode, weatherMode, ntpMode, weatherFormat, dateMode,
+                                   disableSleepMode, SLEEP_HOUR, SLEEP_MINUTE, SYNC_HOUR, SYNC_MINUTE
+                                  };
       res = NVS.setBlob("dezign", dezignString, sizeof(dezignString)); // store dezign [11] to key "dezign" on NVS
     }
   }
+
+#ifdef ENABLEBORDERS
+  display.epd2.setDarkBorder(true);
+#endif
 
   esp_sleep_wakeup_cause_t wakeup_reason;
   wakeup_reason = esp_sleep_get_wakeup_cause(); //get wake up reason
   Wire.begin(SDA, SCL); //init i2c
   RTC.init();
 
+  // Init the display here for all cases, if unused, it will do nothing
+  display.init(0, displayFullInit_, 10, true); // 10ms by spec, and fast pulldown reset
+  display.epd2.setBusyCallback(displayBusyCallback);
+
   switch (wakeup_reason)
   {
     case ESP_SLEEP_WAKEUP_EXT0: //RTC Alarm
-        RTC.clearAlarm(); //resets the alarm flag in the RTC
       if (guiState == WATCHFACE_STATE) {
-        RTC.read(currentTime);
-
-        if (currentTime.Hour == SLEEP_HOUR && currentTime.Minute == SLEEP_MINUTE && !disableSleepMode) {
+        RTC.read(watchyTime);
+        if (watchyTime.Hour == SLEEP_HOUR && watchyTime.Minute == SLEEP_MINUTE && !disableSleepMode) {
           sleep_mode = true;
-//            RTC.alarmInterrupt(ALARM_2, false); 
+          isSleeping = true;
           interruptAlarm(false);
         }
-
         showWatchFace(true); //partial updates on tick
       }
       break;
@@ -142,20 +154,20 @@ void WatchyBase::init(String datetime) {
     case ESP_SLEEP_WAKEUP_EXT1: //button Press + no handling if wakeup
       if (sleep_mode) {
         sleep_mode = false;
-//        RTC.alarmInterrupt(ALARM_2, true);
+        isSleeping = true;
         interruptAlarm(true);
         runOnce = true;
-        RTC.read(currentTime);
+        RTC.read(watchyTime);
         showWatchFace(false); //full update on wakeup from sleep mode
         break;
       }
-
       handleButtonPress();
       break;
 
     default: //reset
       RTC.config(datetime);
       _bmaConfig();
+      RTC.read(watchyTime);
       showWatchFace(true); //full update on reset
       break;
   }
@@ -170,19 +182,33 @@ void WatchyBase::init(String datetime) {
   deepSleep();
 }
 
+void WatchyBase::displayBusyCallback(const void*) {
+  gpio_wakeup_enable((gpio_num_t)BUSY, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  esp_light_sleep_start();
+}
+
 void WatchyBase::deepSleep() {
+  display.hibernate();
+  displayFullInit_ = false; // Notify not to init it again
+  RTC.clearAlarm(); //resets the alarm flag in the RTC
+  // Set pins 0-39 to input to avoid power leaking out
+  for (int i = 0; i < 40; i++) {
+    pinMode(i, INPUT);
+  }
   esp_sleep_enable_ext0_wakeup(RTC_PIN, 0); //enable deep sleep wake on RTC interrupt
-  esp_sleep_enable_ext1_wakeup(EXT_INT_MASK, ESP_EXT1_WAKEUP_ANY_HIGH); //enable deep sleep wake on button press
+  //    esp_sleep_enable_ext1_wakeup(BTN_PIN_MASK | ACC_INT_MASK, ESP_EXT1_WAKEUP_ANY_HIGH); //enable deep sleep wake on button press
+  esp_sleep_enable_ext1_wakeup(BTN_PIN_MASK, ESP_EXT1_WAKEUP_ANY_HIGH); //enable deep sleep wake on button press
   esp_deep_sleep_start();
 }
 
 void WatchyBase::saveVars() {
-  //[0]watchFace, [1]twelveMode, [2]animMode, [3]weatherMode, [4]syncNTP, [5]darkMode, [6]weatherFormat, [7]dateMode
-  //[8]disableSleepMode, [9]SLEEP_HOUR, [10]SLEEP_MINUTE, [11]SYNC_HOUR, [12]SYNC_MINUTE
-  uint8_t dezignString [13] = {watchFace, twelveMode, animMode, weatherMode, syncNTP, darkMode, weatherFormat, dateMode,
+  //[0]watchFace, [1]twelveMode, [2]animMode, [3]weatherMode, [4]ntpMode, [5]weatherFormat, [6]dateMode
+  //[7]disableSleepMode, [8]SLEEP_HOUR, [9]SLEEP_MINUTE, [10]SYNC_HOUR, [11]SYNC_MINUTE
+  uint8_t dezignString [12] = {watchFace, twelveMode, animMode, weatherMode, ntpMode, weatherFormat, dateMode,
                                disableSleepMode, SLEEP_HOUR, SLEEP_MINUTE, SYNC_HOUR, SYNC_MINUTE
                               };
-  res = NVS.setBlob("dezign", dezignString, sizeof(dezignString)); // store dezign [13] to key "dezign" on NVS
+  res = NVS.setBlob("dezign", dezignString, sizeof(dezignString)); // store dezign [12] to key "dezign" on NVS
 }
 
 void WatchyBase::handleButtonPress() {
@@ -235,15 +261,13 @@ void WatchyBase::handleButtonPress() {
         default:
           break;
       }
-    } else if (guiState == FW_UPDATE_STATE) {
-      updateFWBegin();
     }
   }
   //Back Button
   else if (wakeupBit & BACK_BTN_MASK) {
     if (guiState == MAIN_MENU_STATE) { //exit to watch face if already in menu
       RTC.clearAlarm();
-      RTC.read(currentTime);
+      RTC.read(watchyTime);
       showWatchFace(true);
       menuIndex = 0;
     } else if (guiState == APP_STATE) {
@@ -273,26 +297,34 @@ void WatchyBase::handleButtonPress() {
     }
   }
 
+  //  if (IS_DOUBLE_TAP){
+  //        while(!sensor.getINT()){
+  //            // Wait until interrupt is cleared.
+  //            // Otherwise it will fire again and again.
+  //        }
+  //
+  //        // To be defined in the watch face what we want exactly
+  //        // to do. Therefore, no return;
+  //    }
+
   if (IS_BTN_LEFT_UP) {
-    //    twelveMode = (twelveMode == 0) ? true : false;
-    RTC.read(currentTime);
     vibrate();
-    showWatchFace(true);
     return;
   }
 
   if (IS_BTN_RIGHT_UP) {
-    RTC.read(currentTime);
+    RTC.read(watchyTime);
     vibrate();
-    darkMode = (!darkMode) ? true : false;
-    if(watchFace != 0 && watchFace != 1 && watchFace != 6 && watchFace != 9)
-    saveVars();
+    if (hasDarkMode)
+      darkMode = darkMode ? false : true;
+    else
+      dateToggle = dateToggle ? false : true;
     showWatchFace(true);
     return;
   }
 
   if (IS_BTN_RIGHT_DOWN) {
-    RTC.read(currentTime);
+    RTC.read(watchyTime);
     if (watchFace != 9)
       vibrate();
     watchAction = (!watchAction) ? true : false;
@@ -357,15 +389,16 @@ void WatchyBase::handleButtonPress() {
             default:
               break;
           }
-        } else if (guiState == FW_UPDATE_STATE) {
-          updateFWBegin();
         }
+        //        else if (guiState == FW_UPDATE_STATE) {
+        //          updateFWBegin();
+        //        }
       } else if (digitalRead(BACK_BTN_PIN) == 1) {
         vibrate();
         lastTimeout = millis();
         if (guiState == MAIN_MENU_STATE) { //exit to watch face if already in menu
           RTC.clearAlarm();
-          RTC.read(currentTime);
+          RTC.read(watchyTime);
           showWatchFace(false);
           break; //leave loop
         } else if (guiState == APP_STATE) {
@@ -498,9 +531,9 @@ void WatchyBase::_bmaConfig() {
   // Enable BMA423 isStepCounter feature
   sensor.enableFeature(BMA423_STEP_CNTR, true);
   // Enable BMA423 isTilt feature
-  sensor.enableFeature(BMA423_TILT, true);
+  sensor.enableFeature(BMA423_TILT, false);
   // Enable BMA423 isDoubleClick feature
-  //sensor.enableFeature(BMA423_WAKEUP, true);
+  sensor.enableFeature(BMA423_WAKEUP, false);
 
   // Reset steps
   //sensor.resetStepCounter();
@@ -509,7 +542,7 @@ void WatchyBase::_bmaConfig() {
   //sensor.enableStepCountInterrupt();
   //sensor.enableTiltInterrupt();
   // It corresponds to isDoubleClick interrupt
-  //sensor.enableWakeupInterrupt();
+  //  sensor.enableWakeupInterrupt();
 }
 
 uint16_t WatchyBase::_readRegister(uint8_t address, uint8_t reg, uint8_t *data, uint16_t len) {
@@ -609,6 +642,275 @@ void WatchyBase::showFastMenu(byte menuIndex) {
   guiState = MAIN_MENU_STATE;
 }
 
+void WatchyBase::showBattery() {
+  display.setFullWindow();
+  display.fillScreen(GxEPD_BLACK);
+  display.setFont(&FreeMonoBold9pt7b);
+  display.setTextColor(GxEPD_WHITE);
+  display.setCursor(20, 30);
+  display.println("Battery Voltage:");
+  float voltage = getBatteryVoltage();
+  display.setCursor(70, 80);
+  display.print(voltage);
+  display.println("V");
+  display.display(false); //full refresh
+
+  guiState = APP_STATE;
+}
+
+void WatchyBase::vibMotor(uint8_t intervalMs, uint8_t length) {
+  pinMode(VIB_MOTOR_PIN, OUTPUT);
+  bool motorOn = false;
+  for (int i = 0; i < length; i++) {
+    motorOn = !motorOn;
+    digitalWrite(VIB_MOTOR_PIN, motorOn);
+    delay(intervalMs);
+  }
+}
+
+void WatchyBase::setTime() {
+
+  guiState = APP_STATE;
+
+  RTC.read(watchyTime);
+
+  int8_t minute = watchyTime.Minute;
+  int8_t hour = watchyTime.Hour;
+  int8_t day = watchyTime.Day;
+  int8_t month = watchyTime.Month;
+  int8_t year = tmYearToY2k(watchyTime.Year);
+
+  int8_t setIndex = SET_HOUR;
+
+  int8_t blink = 0;
+
+  pinMode(DOWN_BTN_PIN, INPUT);
+  pinMode(UP_BTN_PIN, INPUT);
+  pinMode(MENU_BTN_PIN, INPUT);
+  pinMode(BACK_BTN_PIN, INPUT);
+
+  display.setFullWindow();
+
+  while (1) {
+
+    if (digitalRead(MENU_BTN_PIN) == 1) {
+      setIndex++;
+      if (setIndex > SET_DAY) {
+        break;
+      }
+    }
+    if (digitalRead(BACK_BTN_PIN) == 1) {
+      if (setIndex != SET_HOUR) {
+        setIndex--;
+      }
+    }
+
+    blink = 1 - blink;
+
+    if (digitalRead(DOWN_BTN_PIN) == 1) {
+      blink = 1;
+      switch (setIndex) {
+        case SET_HOUR:
+          hour == 23 ? (hour = 0) : hour++;
+          break;
+        case SET_MINUTE:
+          minute == 59 ? (minute = 0) : minute++;
+          break;
+        case SET_YEAR:
+          year == 99 ? (year = 0) : year++;
+          break;
+        case SET_MONTH:
+          month == 12 ? (month = 1) : month++;
+          break;
+        case SET_DAY:
+          day == 31 ? (day = 1) : day++;
+          break;
+        default:
+          break;
+      }
+    }
+
+    if (digitalRead(UP_BTN_PIN) == 1) {
+      blink = 1;
+      switch (setIndex) {
+        case SET_HOUR:
+          hour == 0 ? (hour = 23) : hour--;
+          break;
+        case SET_MINUTE:
+          minute == 0 ? (minute = 59) : minute--;
+          break;
+        case SET_YEAR:
+          year == 0 ? (year = 99) : year--;
+          break;
+        case SET_MONTH:
+          month == 1 ? (month = 12) : month--;
+          break;
+        case SET_DAY:
+          day == 1 ? (day = 31) : day--;
+          break;
+        default:
+          break;
+      }
+    }
+
+    display.fillScreen(GxEPD_BLACK);
+    display.setTextColor(GxEPD_WHITE);
+    display.setFont(&DSEG7_Classic_Bold_53);
+
+    display.setCursor(5, 80);
+    if (setIndex == SET_HOUR) { //blink hour digits
+      display.setTextColor(blink ? GxEPD_WHITE : GxEPD_BLACK);
+    }
+    if (hour < 10) {
+      display.print("0");
+    }
+    display.print(hour);
+
+    display.setTextColor(GxEPD_WHITE);
+    display.print(":");
+
+    display.setCursor(108, 80);
+    if (setIndex == SET_MINUTE) { //blink minute digits
+      display.setTextColor(blink ? GxEPD_WHITE : GxEPD_BLACK);
+    }
+    if (minute < 10) {
+      display.print("0");
+    }
+    display.print(minute);
+
+    display.setTextColor(GxEPD_WHITE);
+
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(45, 150);
+    if (setIndex == SET_YEAR) { //blink minute digits
+      display.setTextColor(blink ? GxEPD_WHITE : GxEPD_BLACK);
+    }
+    display.print(2000 + year);
+
+    display.setTextColor(GxEPD_WHITE);
+    display.print("/");
+
+    if (setIndex == SET_MONTH) { //blink minute digits
+      display.setTextColor(blink ? GxEPD_WHITE : GxEPD_BLACK);
+    }
+    if (month < 10) {
+      display.print("0");
+    }
+    display.print(month);
+
+    display.setTextColor(GxEPD_WHITE);
+    display.print("/");
+
+    if (setIndex == SET_DAY) { //blink minute digits
+      display.setTextColor(blink ? GxEPD_WHITE : GxEPD_BLACK);
+    }
+    if (day < 10) {
+      display.print("0");
+    }
+    display.print(day);
+    display.display(true); //partial refresh
+  }
+
+  tmElements_t tm;
+  tm.Month = month;
+  tm.Day = day;
+  tm.Year = y2kYearToTm(year);
+  tm.Hour = hour;
+  tm.Minute = minute;
+  tm.Second = 0;
+
+  RTC.set(tm);
+
+  showMenu(menuIndex, false);
+
+}
+
+void WatchyBase::showWatchFace(bool partialRefresh) {
+  display.setFullWindow();
+  drawWatchFace();
+  display.display(partialRefresh); //partial refresh
+  guiState = WATCHFACE_STATE;
+}
+
+void WatchyBase::drawWatchFace() {
+  display.setFont(&DSEG7_Classic_Bold_53);
+  display.setCursor(5, 53 + 60);
+  if (watchyTime.Hour < 10) {
+    display.print("0");
+  }
+  display.print(watchyTime.Hour);
+  display.print(":");
+  if (watchyTime.Minute < 10) {
+    display.print("0");
+  }
+  display.println(watchyTime.Minute);
+}
+
+float WatchyBase::getBatteryVoltage() {
+  if (RTC.rtcType == DS3231) {
+    return analogReadMilliVolts(V10_ADC_PIN) / 1000.0f * 2.0f; // Battery voltage goes through a 1/2 divider.
+  } else {
+    return analogReadMilliVolts(V15_ADC_PIN) / 1000.0f * 2.0f;
+  }
+}
+
+void WatchyBase::setupWifi() {
+  display.epd2.setBusyCallback(0); //temporarily disable lightsleep on busy
+  WiFiManager wifiManager;
+  wifiManager.resetSettings();
+  wifiManager.setTimeout(WIFI_AP_TIMEOUT);
+  wifiManager.setAPCallback(_configModeCallback);
+  display.setFullWindow();
+  display.fillScreen(GxEPD_BLACK);
+  display.setFont(&FreeMonoBold9pt7b);
+  display.setTextColor(GxEPD_WHITE);
+  if (!wifiManager.autoConnect(WIFI_AP_SSID)) { //WiFi setup failed
+    display.println("Setup failed &");
+    display.println("timed out!");
+  } else {
+    display.println("Connected to");
+    display.println(WiFi.SSID());
+  }
+  display.display(false); //full refresh
+  //turn off radios
+  WiFi.mode(WIFI_OFF);
+  btStop();
+  display.epd2.setBusyCallback(displayBusyCallback); //enable lightsleep on busy
+  guiState = APP_STATE;
+}
+
+void WatchyBase::_configModeCallback (WiFiManager *myWiFiManager) {
+  display.setFullWindow();
+  display.fillScreen(GxEPD_BLACK);
+  display.setFont(&FreeMonoBold9pt7b);
+  display.setTextColor(GxEPD_WHITE);
+  display.setCursor(0, 30);
+  display.println("Connect to");
+  display.print("SSID: ");
+  display.println(WIFI_AP_SSID);
+  display.print("IP: ");
+  display.println(WiFi.softAPIP());
+  display.display(false); //full refresh
+}
+
+bool WatchyBase::connectWiFi() {
+  if (WL_CONNECT_FAILED == WiFi.begin()) { //WiFi not setup, you can also use hard coded credentials with WiFi.begin(SSID,PASS);
+    WIFI_CONFIGURED = false;
+  } else {
+    if (WL_CONNECTED == WiFi.waitForConnectResult()) { //attempt to connect for 10s
+      WIFI_CONFIGURED = true;
+    } else { //connection failed, time out
+      WIFI_CONFIGURED = false;
+      //turn off radios
+      WiFi.mode(WIFI_OFF);
+      btStop();
+    }
+  }
+  return WIFI_CONFIGURED;
+}
+
+//------------999-------------//
+
 void WatchyBase::watchfaceApp() {
   guiState == APP_STATE;
   display.init(0, false); //_initial_refresh to false to prevent full update on init
@@ -618,7 +920,7 @@ void WatchyBase::watchfaceApp() {
   display.setTextColor(GxEPD_WHITE);
   display.fillScreen(GxEPD_BLACK);
 
-  const char* listItems[] = {"DKtime", "pxl", "slides", "synth", "Crush Em", "lowBatt", "Watchytris", "G5600 by NiVZ", "Pebble", "Doom999"};
+  const char* listItems[] = {"DKtime", "pxl", "slides", "synth", "Crush Em", "lowBatt", "Watchytris", "G5600 by NiVZ", "Pebble", "Doom999", "Qlockchy"};
   byte itemCount = sizeof(listItems) / sizeof(listItems[0]);
 
   uint16_t listIndex = watchFace;
@@ -629,14 +931,19 @@ void WatchyBase::watchfaceApp() {
   while (1) {
 
     if (digitalRead(BACK_BTN_PIN) == 1) {
-      saveVars();
       vibrate();
+      if (saveChanges)
+        saveVars();
+      saveChanges = false;
       break;
     }
 
     if (digitalRead(MENU_BTN_PIN) == 1) {
       vibrate();
-      watchFace = listIndex;
+      if (listIndex != watchFace) {
+        watchFace = listIndex;
+        saveChanges = true;
+      }
       switchFace = true;
       showList(listItems, itemCount, listIndex, true, true);
     }
@@ -678,14 +985,19 @@ void WatchyBase::animationApp() {
   while (1) {
 
     if (digitalRead(BACK_BTN_PIN) == 1) {
-      saveVars();
       vibrate();
+      if (saveChanges)
+        saveVars();
+      saveChanges = false;
       break;
     }
 
     if (digitalRead(MENU_BTN_PIN) == 1) {
       vibrate();
-      animMode = listIndex;
+      if (listIndex != animMode) {
+        animMode = listIndex;
+        saveChanges = true;
+      }
       showList(listItems, itemCount, listIndex, true, true);
     }
 
@@ -726,8 +1038,10 @@ void WatchyBase::weatherApp() {
   while (1) {
 
     if (digitalRead(BACK_BTN_PIN) == 1) {
-      saveVars();
       vibrate();
+      if (saveChanges)
+        saveVars();
+      saveChanges = false;
       break;
     }
 
@@ -735,7 +1049,10 @@ void WatchyBase::weatherApp() {
       vibrate();
       if (listIndex != 3) {
         switchFace = true;
-        weatherMode = listIndex;
+        if (listIndex != weatherMode) {
+          weatherMode = listIndex;
+          saveChanges = true;
+        }
         showList(listItems, itemCount, listIndex, true, true);
       } else if (listIndex == 3) {
 
@@ -819,13 +1136,18 @@ void WatchyBase::weatherFormatApp() {
   while (1) {
 
     if (digitalRead(BACK_BTN_PIN) == 1) {
-      saveVars();
       vibrate();
+      if (saveChanges)
+        saveVars();
+      saveChanges = false;
       break;
     }
 
     if (digitalRead(MENU_BTN_PIN) == 1) {
-      weatherFormat = (listIndex == 0) ? 0 : 1;
+      if (listIndex != weatherFormat) {
+        weatherFormat = (listIndex == 0) ? 0 : 1;
+        saveChanges = true;
+      }
       vibrate();
       showList(listItems, itemCount, listIndex, true, true);
     }
@@ -836,7 +1158,7 @@ void WatchyBase::weatherFormatApp() {
       showList(listItems, itemCount, listIndex, false, true);
       if (debugger)
         Serial.println(String(listIndex));
-      RTC.read(currentTime);
+      RTC.read(watchyTime);
     }
 
     if (digitalRead(UP_BTN_PIN) == 1) {
@@ -845,7 +1167,7 @@ void WatchyBase::weatherFormatApp() {
       showList(listItems, itemCount, listIndex, false, true);
       if (debugger)
         Serial.println(String(listIndex));
-      RTC.read(currentTime);
+      RTC.read(watchyTime);
     }
 
   }
@@ -867,14 +1189,19 @@ void WatchyBase::twelveModeApp() {
   while (1) {
 
     if (digitalRead(BACK_BTN_PIN) == 1) {
-      saveVars();
       vibrate();
+      if (saveChanges)
+        saveVars();
+      saveChanges = false;
       break;
     }
 
     if (digitalRead(MENU_BTN_PIN) == 1) {
-      twelveMode = (listIndex == 0) ? 0 : 1;
       vibrate();
+      if (listIndex != twelveMode) {
+        twelveMode = (listIndex == 0) ? 0 : 1;
+        saveChanges = true;
+      }
       showList(listItems, itemCount, listIndex, true, true);
     }
 
@@ -884,7 +1211,7 @@ void WatchyBase::twelveModeApp() {
       showList(listItems, itemCount, listIndex, false, true);
       if (debugger)
         Serial.println(String(listIndex));
-      RTC.read(currentTime);
+      RTC.read(watchyTime);
     }
 
     if (digitalRead(UP_BTN_PIN) == 1) {
@@ -893,7 +1220,7 @@ void WatchyBase::twelveModeApp() {
       showList(listItems, itemCount, listIndex, false, true);
       if (debugger)
         Serial.println(String(listIndex));
-      RTC.read(currentTime);
+      RTC.read(watchyTime);
     }
 
   }
@@ -916,17 +1243,17 @@ void WatchyBase::sleepModeApp() {
 
     if (digitalRead(BACK_BTN_PIN) == 1) {
       vibrate();
-      saveVars();
-      if (debugger) {
-        Serial.print("disableSleepMode: ");
-        Serial.println((disableSleepMode) ? "True" : "False");
-      }
+      if (saveChanges)
+        saveVars();
+      saveChanges = false;
       break;
     }
 
     if (digitalRead(MENU_BTN_PIN) == 1) {
       vibrate();
       if (listIndex < 2) {
+        if (listIndex != disableSleepMode)
+          saveChanges = true;
         disableSleepMode = listIndex;
         showList(listItems, itemCount, listIndex, true, true);
       } else if (listIndex == 2) {
@@ -1043,7 +1370,7 @@ void WatchyBase::sleepModeApp() {
       showList(listItems, itemCount, listIndex, false, true);
       if (debugger)
         Serial.println(String(listIndex));
-      RTC.read(currentTime);
+      RTC.read(watchyTime);
     }
 
     if (digitalRead(UP_BTN_PIN) == 1) {
@@ -1052,18 +1379,18 @@ void WatchyBase::sleepModeApp() {
       showList(listItems, itemCount, listIndex, false, true);
       if (debugger)
         Serial.println(String(listIndex));
-      RTC.read(currentTime);
+      RTC.read(watchyTime);
     }
 
   }
 
   if (listIndex == 2) {
     sleep_mode = true;
-    saveVars();
-    
-    interruptAlarm(false); 
-    
-    RTC.read(currentTime);
+    isSleeping = true;
+    //    saveVars();
+    interruptAlarm(false);
+
+    RTC.read(watchyTime);
     showWatchFace(true);
     menuIndex = 0;
   }
@@ -1087,14 +1414,19 @@ void WatchyBase::dateModeApp() {
   while (1) {
 
     if (digitalRead(BACK_BTN_PIN) == 1) {
-      saveVars();
       vibrate();
+      if (saveChanges)
+        saveVars();
+      saveChanges = false;
       break;
     }
 
     if (digitalRead(MENU_BTN_PIN) == 1) {
-      dateMode = (listIndex == 0) ? 0 : 1;
       vibrate();
+      if (listIndex != dateMode) {
+        dateMode = (listIndex == 0) ? 0 : 1;
+        saveChanges = true;
+      }
       showList(listItems, itemCount, listIndex, true, true);
     }
 
@@ -1104,7 +1436,7 @@ void WatchyBase::dateModeApp() {
       showList(listItems, itemCount, listIndex, false, true);
       if (debugger)
         Serial.println(String(listIndex));
-      RTC.read(currentTime);
+      RTC.read(watchyTime);
     }
 
     if (digitalRead(UP_BTN_PIN) == 1) {
@@ -1113,7 +1445,7 @@ void WatchyBase::dateModeApp() {
       showList(listItems, itemCount, listIndex, false, true);
       if (debugger)
         Serial.println(String(listIndex));
-      RTC.read(currentTime);
+      RTC.read(watchyTime);
     }
 
   }
@@ -1128,18 +1460,20 @@ void WatchyBase::ntpApp() {
   byte itemCount = sizeof(listItems) / sizeof(listItems[0]);
 
   //  uint16_t listIndex = syncIndex;
-  uint16_t listIndex = syncNTP;
+  uint16_t listIndex = ntpMode;
 
   bool synced = false;
 
   //Send the stored animMode value to set the selected item
-  showList(listItems, itemCount, syncNTP, true, false);
+  showList(listItems, itemCount, ntpMode, true, false);
 
   while (1) {
 
     if (digitalRead(BACK_BTN_PIN) == 1) {
-      saveVars();
       vibrate();
+      if (saveChanges)
+        saveVars();
+      saveChanges = false;
       break;
     }
 
@@ -1152,7 +1486,6 @@ void WatchyBase::ntpApp() {
 
     if (digitalRead(UP_BTN_PIN) == 1) {
       listIndex == 0 ? (listIndex = (itemCount - 1)) : listIndex--;
-      syncNTP = (listIndex == 0) ? true : false;
       synced = false;
       vibrate();
       showList(listItems, itemCount, listIndex, false, true);
@@ -1164,8 +1497,9 @@ void WatchyBase::ntpApp() {
         Serial.println("ntp listIndex: " + String(listIndex));
 
       if (listIndex < 3) {
-        syncNTP = listIndex;
-        //        syncIndex = listIndex;
+        if (listIndex != ntpMode)
+          saveChanges = true;
+        ntpMode = listIndex;
         showList(listItems, itemCount, listIndex, true, true);
 
       } else if (listIndex == 3) {
@@ -1181,7 +1515,13 @@ void WatchyBase::ntpApp() {
 
         manualSync = true;
 
-        syncNtpTime();
+        if(syncNtpTime()) {
+          if(debugger)
+            Serial.println("Manual Sync Success");
+        } else {
+          if(debugger)
+            Serial.println("Manual Sync Failed");
+        }
 
         synced = true;
       }  else if (listIndex == 4) {
@@ -1283,18 +1623,13 @@ void WatchyBase::ntpApp() {
 
       }
 
-      if (listIndex != 2) {
+      if (listIndex == 4) {
         listIndex = 0;
         showList(listItems, itemCount, listIndex, false, true);
       }
     }
 
   }
-
-  //  syncNTP = (syncIndex == 1) ? true : false;
-  //  if (syncIndex != 3) {
-  //    syncNTP = syncIndex;
-  //  }
 
   display.hibernate();
   showMenu(menuIndex, false);
@@ -1315,20 +1650,25 @@ void WatchyBase::wifiModeApp() {
 
   while (1) {
 
-
-
     if (digitalRead(BACK_BTN_PIN) == 1) {
       vibrate();
+      if (saveChanges)
+        saveVars();
+      saveChanges = false;
       break;
     }
 
     if (digitalRead(MENU_BTN_PIN) == 1) {
-      wifiMode = (listIndex == 0) ? 0 : 1;
+      if (listIndex != wifiMode) {
+        wifiMode = (listIndex == 0) ? 0 : 1;
+        saveChanges = true;
+      }
       selectCounter++;
       vibrate();
       if (selectCounter < 2)
         showList(listItems, itemCount, listIndex, true, true);
       if (wifiMode == 1) {
+        //        if (selectCounter == 1) {
         display.setTextColor(GxEPD_WHITE);
         display.setCursor(20, 90);
         display.println("SSID Reset");
@@ -1344,6 +1684,7 @@ void WatchyBase::wifiModeApp() {
     }
 
     if (digitalRead(DOWN_BTN_PIN) == 1) {
+      selectCounter = 0;
       listIndex = (listIndex == 0) ? 1 : 0;
       vibrate();
       showList(listItems, itemCount, listIndex, false, true);
@@ -1352,6 +1693,7 @@ void WatchyBase::wifiModeApp() {
     }
 
     if (digitalRead(UP_BTN_PIN) == 1) {
+      selectCounter = 0;
       listIndex = (listIndex == 0) ? 1 : 0;
       vibrate();
       showList(listItems, itemCount, listIndex, false, true);
@@ -1422,12 +1764,13 @@ void WatchyBase::showList(const char* listItems[], byte itemCount, byte listInde
   guiState = APP_STATE;
 }
 
-void WatchyBase::syncNtpTime() {
+bool WatchyBase::syncNtpTime() {
 
-  if (debugger)
-    Serial.println("Syncing NTP");
+  bool syncFailed = false;
 
-  if (!runOnce) {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (debugger)
+      Serial.println("Syncing NTP");
     if (wifiMode == 0) {
       if (debugger)
         Serial.println("Trying wifi999");
@@ -1437,14 +1780,11 @@ void WatchyBase::syncNtpTime() {
         Serial.println("Trying WiFi");
       connectWiFi();
     }
+    if(WiFi.status() != WL_CONNECTED)
+      syncFailed = true;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-
-    time_t t;
-    bool syncFailed = false;
-
-    int gatewayAddress = WiFi.gatewayIP();
 
     if (gmtOffset == 0) { //Get Time Offset
       HTTPClient http;
@@ -1458,7 +1798,6 @@ void WatchyBase::syncNtpTime() {
         String payload = http.getString();
         JSONVar responseObject = JSON.parse(payload);
         offsetStatus = responseObject["status"];
-//        gmtOffset = int(responseObject["offset"]);
         if (strcmp(offsetStatus, "success") != 0) {
           if (manualSync) {
             display.setCursor(20, 160);
@@ -1478,84 +1817,65 @@ void WatchyBase::syncNtpTime() {
       }
     }
 
-    
-
-//    time_t now = time(nullptr);
-
-
     if (debugger) {
       Serial.println("Offset: " + String(gmtOffset));
-      Serial.println("GatewayIP: " + String(gatewayAddress));
-    }  
-
-  if (!syncFailed) {
-    configTime(gmtOffset, 0, ntpServer);
-
-    int i = 0;
-      while (!sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED && i < 20) {
-//      while (now < SECS_YR_2000 && i < 20) { // possible fix
-//      now = time(nullptr);
-      if (debugger)
-        Serial.print(".");
-      delay(1000);
-      i++;
-      if(debugger)
-        Serial.println("i = " + String(i));
-      if (i == 20) {
-        if (manualSync) {
-          display.setCursor(20, 160);
-          display.println("Failed to sync");
-        }
-        syncFailed = true;
-        break;
-      }
     }
-  }
 
     if (!syncFailed) {
-      time_t tnow = time(nullptr);
-      struct tm *local = localtime(&tnow);
+      WiFiUDP ntpUDP;
+      NTPClient timeClient(ntpUDP, ntpServer, gmtOffset);
+      timeClient.begin();
+      if(!timeClient.forceUpdate()){
+        syncFailed = true;
+        if(debugger)
+          Serial.println("NTP 404");
+      }
+      tmElements_t tm;   
+      breakTime((time_t)timeClient.getEpochTime(), tm);              
+      RTC.set(tm);
+      RTC.read(watchyTime);
       if (manualSync) {
         display.setCursor(20, 160);
         display.println("Offset: " + String(gmtOffset));
         display.setCursor(20, 175);
-        if (local->tm_hour < 10) {
+        if (watchyTime.Hour < 10) {
           display.print("0");
         }
-        display.print(local->tm_hour);
+        display.print(watchyTime.Hour);
         display.print(":");
-        if (local->tm_min < 10) {
+        if (watchyTime.Minute < 10) {
           display.print("0");
         }
-        display.print(local->tm_min);
+        display.println(watchyTime.Minute);
+        display.setCursor(20, 190);
+        display.println(String(2000 + tmYearToY2k(watchyTime.Year)));
       }
-
-      currentTime.Year = local->tm_year + YEAR_OFFSET - 2040; //This change matches watchy defaults
-      currentTime.Month = local->tm_mon + 1;
-      currentTime.Day = local->tm_mday;
-      currentTime.Hour = local->tm_hour;
-      currentTime.Minute = local->tm_min;
-      currentTime.Second = local->tm_sec;
-      currentTime.Wday = local->tm_wday + 1;
-      RTC.set(currentTime);
-      RTC.read(currentTime);
-
     }
-  } else {
+  } 
+  
+  if (syncFailed) {
     if (debugger)
-      Serial.println("No WiFi");
+      Serial.println("Sync Failed");
     if (manualSync) {
       display.setCursor(20, 160);
-      display.println("No WiFi Found");
+      display.println("Sync Failed");
     }
   }
 
   disableWiFi();
+    
   display.display(true);
   if (manualSync)
     delay(3000);
-    
+  if (debugger)
+    Serial.println("NTP Sync Done");
   manualSync = false;
+  initialSync = true;
+  
+  if(syncFailed)
+    return false;
+  else
+    return true;
 }
 
 void WatchyBase::disableWiFi() {
@@ -1650,8 +1970,8 @@ bool WatchyBase::noAlpha(String str) { //Check if the city name is an ID code or
 }
 
 int WatchyBase::rtcTemp() {
-//  temperature = (RTC.temperature() / 4) - ambientOffset; //celsius
-    temperature = sensor.readTemperature() - ambientOffset; //celsius
+  //  temperature = (RTC.temperature() / 4) - ambientOffset; //celsius
+  temperature = sensor.readTemperature() - ambientOffset; //celsius
   if (debugger)
     Serial.println("rtcTemp(): " + String(temperature));
   return temperature;
@@ -1679,17 +1999,24 @@ String WatchyBase::getCityName() {
 
 weatherData WatchyBase::weather999() {
 
+  bool syncFailed = false;
+
   if (debugger)
     Serial.println("WifiMode: " + String(wifiMode));
-  if (wifiMode == 0) {
-    if (debugger)
-      Serial.println("Trying wifi999");
-    wifi999();
-  } else {
-    if (debugger)
-      Serial.println("Trying WiFi");
-    connectWiFi();
-  }
+    
+ if (WiFi.status() != WL_CONNECTED) {
+    if (wifiMode == 0) {
+      if (debugger)
+        Serial.println("Trying wifi999");
+      wifi999();
+    } else {
+      if (debugger)
+        Serial.println("Trying WiFi");
+      connectWiFi();
+    }
+    if(WiFi.status() != WL_CONNECTED) 
+      syncFailed = true;
+ }
 
   if (WiFi.status() == WL_CONNECTED) { //Use Weather API for live data if WiFi is connected
 
@@ -1701,9 +2028,7 @@ weatherData WatchyBase::weather999() {
     weatherQueryURL = weatherQueryURL + String("&units=metric&appid=") + String(APIKEY);
 
     if (debugger) {
-      Serial.print("CITY NAME OR ID: ");
-      Serial.println(noAlpha(getCityName()) ? "ID" : "NAME");
-      Serial.println("weatherQueryURL = " + weatherQueryURL);
+      Serial.println("Getting Weather");
     }
 
     http.begin(weatherQueryURL.c_str());
@@ -1720,12 +2045,15 @@ weatherData WatchyBase::weather999() {
       if (manualSync) {
         display.setCursor(20, 145);
         display.println("Failed to sync");
+        syncFailed = true;
       }
     }
 
     http.end();
 
-  } else {
+  }
+  
+  if (syncFailed) {
     //No WiFi, use RTC Temperature
     temperature = rtcTemp() - ambientOffset;
     latestWeather.temperature = temperature;
@@ -1738,17 +2066,7 @@ weatherData WatchyBase::weather999() {
     latestWeather.weatherConditionCode = weatherConditionCode;
   }
 
-  if (!runOnce) {
-    disableWiFi();
-    if (debugger)
-      Serial.println("disabling weather wifi");
-  }
+  disableWiFi();
   return latestWeather;
   manualSync = false;
-
-  if (runOnce) {
-    display.display(false);
-  } else {
-    display.display(true);
-  }
 }

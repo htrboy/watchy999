@@ -6,9 +6,10 @@ const unsigned char *doom_gun[4] = {doomgun1, doomgun2, doomgun2, doomgun0};
 #define DOOM_FONT DooM16pt7b
 
 void Watchy999::drawDoomWatchFace() {
-
+#ifdef ENABLEBORDERS
   if(switchFace)
-    darkMode = false;
+    display.epd2.setDarkBorder(false);
+#endif
 
   //BG
   display.fillScreen(GxEPD_WHITE);
@@ -22,7 +23,7 @@ void Watchy999::drawDoomWatchFace() {
   display.setTextColor(GxEPD_WHITE);
   display.setFont(&DOOM_FONT);
 
-  if(darkMode) {
+  if(dateToggle) {
     if(dateMode) {
       display.drawBitmap(138, 187, doomMonth, 57, 8, GxEPD_WHITE);
       display.drawBitmap(12, 187, doomDate,  40, 8, GxEPD_WHITE);
@@ -53,7 +54,7 @@ void Watchy999::drawDoomWatchFace() {
       display.display(true);
     }
   } else {
-    display.drawBitmap(50, 0, doom_idle[currentTime.Minute % 2], 88, 93, GxEPD_BLACK);
+    display.drawBitmap(50, 0, doom_idle[watchyTime.Minute % 2], 88, 93, GxEPD_BLACK);
     display.drawBitmap(56, 93, doomgun0, 95, 52, GxEPD_BLACK);
     display.fillRect(83, 151, 36, 46, GxEPD_BLACK);
     display.drawBitmap(83, 151, doomface0, 36, 46, GxEPD_WHITE);
@@ -84,8 +85,8 @@ void Watchy999::drawDoomWatchFace() {
     display.drawBitmap(83, 151, doomface0, 36, 46, GxEPD_WHITE);
   }
 
-  if(darkMode) {
-    darkMode = false;
+  if(dateToggle) {
+    dateToggle = false;
     display.display(true);
     delay(3000);
     showWatchFace(true);
